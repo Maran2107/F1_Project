@@ -1,0 +1,343 @@
+# ============================================================
+# azure-pipelines.yml
+# Enterprise CI/CD pipeline for Databricks Asset Bundle
+# Authenticates via Azure Service Principal (OIDC/client secret)
+# Branching: feature/* → develop → main (full GitFlow)
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - Master          # CD: deploy to UAT on merge to main
+      - Dev        # CI only: validate bundle on develop changes
+  paths:
+    exclude:
+      - README.md
+      - docs/**
+      - .github/**
+
+pr:
+  branches:
+    include:
+      - Master          # PR: feature → develop, develop → main
+      - Dev
+  paths:
+    exclude:
+      - README.md
+      - docs/**
+
+variables:
+  - group: databricks-dev-secrets        # Variable group for Dev
+  - group: databricks-uat-secrets        # Variable group for UAT
+  - group: databricks-common             # Shared non-secret vars
+  - name: pythonVersion
+    value: "3.10"
+  - name: databricksCLIVersion
+    value: "0.220.0"
+
+# ============================================================
+# STAGE 1 — CI: Lint, Validate, Test (ALL branches + PRs)
+# ============================================================
+stages:
+
+  - stage: CI
+    displayName: "CI — Lint, Validate & Test"
+    condition: always()
+    jobs:
+
+      - job: LintAndTest
+        displayName: "Lint & Unit Tests"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+
+          - checkout: self
+            fetchDepth: 0
+            displayName: "Checkout source"
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(pythonVersion)
+            displayName: "Set Python $(pythonVersion)"
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install \
+                flake8 \
+                black \
+                pytest \
+                pytest-cov \
+                pyspark==3.5.0 \
+                databricks-sdk
+            displayName: "Install Python dependencies"
+
+          - script: |
+              echo "▶ Running Black formatter check..."
+              black --check notebooks/ dlt_pipelines/ tests/ \
+                --line-length 120 \
+                --exclude '\.ipynb'
+            displayName: "Black — format check"
+            continueOnError: false
+
+          - script: |
+              echo "▶ Running Flake8 linter..."
+              flake8 notebooks/ dlt_pipelines/ tests/ \
+                --max-line-length=120 \
+                --extend-ignore=E203,W503 \
+                --exclude=__pycache__,.git
+            displayName: "Flake8 — lint"
+            continueOnError: false
+
+          - script: |
+              echo "▶ Running unit tests..."
+              pytest tests/ \
+                -v \
+                --tb=short \
+                --junitxml=$(Build.ArtifactStagingDirectory)/test-results.xml \
+                --cov=notebooks \
+                --cov-report=xml:$(Build.ArtifactStagingDirectory)/coverage.xml \
+                --cov-report=term-missing
+            displayName: "Pytest — unit tests"
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFiles: "$(Build.ArtifactStagingDirectory)/test-results.xml"
+              testRunTitle: "Unit Tests"
+            displayName: "Publish test results"
+
+          - task: PublishCodeCoverageResults@1
+            condition: always()
+            inputs:
+              codeCoverageTool: Cobertura
+              summaryFileLocation: "$(Build.ArtifactStagingDirectory)/coverage.xml"
+            displayName: "Publish coverage report"
+
+      # ── Bundle Validate against Dev ──────────────────────────
+      - job: BundleValidate
+        displayName: "Databricks Bundle Validate"
+        pool:
+          vmImage: ubuntu-latest
+        dependsOn: LintAndTest
+        steps:
+
+          - checkout: self
+            displayName: "Checkout source"
+
+          - script: |
+              curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh \
+                | sh -s -- $(databricksCLIVersion)
+              databricks --version
+            displayName: "Install Databricks CLI $(databricksCLIVersion)"
+
+          - script: |
+              echo "▶ Validating bundle against Dev workspace..."
+              databricks bundle validate \
+                --target dev \
+                --output json
+            displayName: "Bundle validate (dev target)"
+            env:
+              DATABRICKS_HOST:          $(DATABRICKS_HOST_DEV)
+              DATABRICKS_CLIENT_ID:     $(DATABRICKS_SP_CLIENT_ID_DEV)
+              DATABRICKS_CLIENT_SECRET: $(DATABRICKS_SP_CLIENT_SECRET_DEV)
+              ARM_TENANT_ID:            $(ARM_TENANT_ID)
+
+          - script: |
+              echo "▶ Validating bundle against UAT workspace..."
+              databricks bundle validate \
+                --target uat \
+                --output json
+            displayName: "Bundle validate (uat target)"
+            env:
+              DATABRICKS_HOST:          $(DATABRICKS_HOST_UAT)
+              DATABRICKS_CLIENT_ID:     $(DATABRICKS_SP_CLIENT_ID_UAT)
+              DATABRICKS_CLIENT_SECRET: $(DATABRICKS_SP_CLIENT_SECRET_UAT)
+              ARM_TENANT_ID:            $(ARM_TENANT_ID)
+
+# ============================================================
+# STAGE 2 — DEPLOY DEV (on push to develop branch)
+# ============================================================
+
+  - stage: DeployDev
+    displayName: "CD — Deploy to Dev"
+    dependsOn: CI
+    condition: >
+      and(
+        succeeded('CI'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/develop'),
+        ne(variables['Build.Reason'], 'PullRequest')
+      )
+
+    jobs:
+      - deployment: DeployDev
+        displayName: "Deploy bundle to Dev workspace"
+        pool:
+          vmImage: ubuntu-latest
+        environment: "Databricks-DEV"    # No approval gate on Dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+                - checkout: self
+                  displayName: "Checkout source"
+
+                - script: |
+                    curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh \
+                      | sh -s -- $(databricksCLIVersion)
+                  displayName: "Install Databricks CLI"
+
+                - script: |
+                    echo "▶ Deploying bundle to Dev..."
+                    databricks bundle deploy \
+                      --target dev \
+                      --force-lock \
+                      --auto-approve
+                  displayName: "Bundle deploy → Dev"
+                  env:
+                    DATABRICKS_HOST:          $(DATABRICKS_HOST_DEV)
+                    DATABRICKS_CLIENT_ID:     $(DATABRICKS_SP_CLIENT_ID_DEV)
+                    DATABRICKS_CLIENT_SECRET: $(DATABRICKS_SP_CLIENT_SECRET_DEV)
+                    ARM_TENANT_ID:            $(ARM_TENANT_ID)
+
+                - script: |
+                    echo "▶ Updating Dev Repos folder to develop branch..."
+                    databricks repos update \
+                      --path /Repos/databricks-platform \
+                      --branch develop
+                  displayName: "Sync Repos folder → develop"
+                  env:
+                    DATABRICKS_HOST:          $(DATABRICKS_HOST_DEV)
+                    DATABRICKS_CLIENT_ID:     $(DATABRICKS_SP_CLIENT_ID_DEV)
+                    DATABRICKS_CLIENT_SECRET: $(DATABRICKS_SP_CLIENT_SECRET_DEV)
+                    ARM_TENANT_ID:            $(ARM_TENANT_ID)
+
+                - script: |
+                    python scripts/post_deploy_summary.py \
+                      --env dev \
+                      --build $(Build.BuildNumber) \
+                      --branch $(Build.SourceBranchName)
+                  displayName: "Post-deploy summary"
+                  env:
+                    DATABRICKS_HOST:          $(DATABRICKS_HOST_DEV)
+                    DATABRICKS_CLIENT_ID:     $(DATABRICKS_SP_CLIENT_ID_DEV)
+                    DATABRICKS_CLIENT_SECRET: $(DATABRICKS_SP_CLIENT_SECRET_DEV)
+
+# ============================================================
+# STAGE 3 — DEPLOY UAT (on merge to main, after approval gate)
+# ============================================================
+
+  - stage: DeployUAT
+    displayName: "CD — Deploy to UAT"
+    dependsOn: CI
+    condition: >
+      and(
+        succeeded('CI'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+        ne(variables['Build.Reason'], 'PullRequest')
+      )
+
+    jobs:
+
+      # ── Pre-deploy checklist job ─────────────────────────────
+      - job: PreDeployCheck
+        displayName: "Pre-deploy checks"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          - script: |
+              echo "▶ Verifying main branch is ahead of develop..."
+              git fetch origin
+              BEHIND=$(git rev-list --count origin/main..origin/develop)
+              if [ "$BEHIND" -gt "0" ]; then
+                echo "⚠️  WARNING: develop has $BEHIND commits not in main"
+              else
+                echo "✅ main is up to date with develop"
+              fi
+            displayName: "Branch drift check"
+
+          - script: |
+              echo "Build: $(Build.BuildNumber)"
+              echo "Triggered by: $(Build.RequestedFor)"
+              echo "Source branch: $(Build.SourceBranchName)"
+              echo "Commit: $(Build.SourceVersion)"
+            displayName: "Print deploy metadata"
+
+      # ── The actual UAT deployment (with approval gate) ───────
+      - deployment: DeployUAT
+        displayName: "Deploy bundle to UAT workspace"
+        pool:
+          vmImage: ubuntu-latest
+        dependsOn: PreDeployCheck
+        environment: "Databricks-UAT"   # ← Approval gate is set HERE in Azure DevOps UI
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+                - checkout: self
+                  displayName: "Checkout source"
+
+                - script: |
+                    curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh \
+                      | sh -s -- $(databricksCLIVersion)
+                  displayName: "Install Databricks CLI"
+
+                - script: |
+                    echo "▶ Running bundle diff (what will change in UAT)..."
+                    databricks bundle deploy \
+                      --target uat \
+                      --dry-run 2>&1 || true
+                  displayName: "Bundle diff (dry run)"
+                  env:
+                    DATABRICKS_HOST:          $(DATABRICKS_HOST_UAT)
+                    DATABRICKS_CLIENT_ID:     $(DATABRICKS_SP_CLIENT_ID_UAT)
+                    DATABRICKS_CLIENT_SECRET: $(DATABRICKS_SP_CLIENT_SECRET_UAT)
+                    ARM_TENANT_ID:            $(ARM_TENANT_ID)
+
+                - script: |
+                    echo "▶ Deploying bundle to UAT..."
+                    databricks bundle deploy \
+                      --target uat \
+                      --force-lock \
+                      --auto-approve
+                  displayName: "Bundle deploy → UAT"
+                  env:
+                    DATABRICKS_HOST:          $(DATABRICKS_HOST_UAT)
+                    DATABRICKS_CLIENT_ID:     $(DATABRICKS_SP_CLIENT_ID_UAT)
+                    DATABRICKS_CLIENT_SECRET: $(DATABRICKS_SP_CLIENT_SECRET_UAT)
+                    ARM_TENANT_ID:            $(ARM_TENANT_ID)
+
+                - script: |
+                    echo "▶ Updating UAT Repos folder to main branch..."
+                    databricks repos update \
+                      --path /Repos/databricks-platform \
+                      --branch main
+                  displayName: "Sync Repos folder → main"
+                  env:
+                    DATABRICKS_HOST:          $(DATABRICKS_HOST_UAT)
+                    DATABRICKS_CLIENT_ID:     $(DATABRICKS_SP_CLIENT_ID_UAT)
+                    DATABRICKS_CLIENT_SECRET: $(DATABRICKS_SP_CLIENT_SECRET_UAT)
+                    ARM_TENANT_ID:            $(ARM_TENANT_ID)
+
+                - script: |
+                    python scripts/post_deploy_summary.py \
+                      --env uat \
+                      --build $(Build.BuildNumber) \
+                      --branch $(Build.SourceBranchName)
+                  displayName: "Post-deploy summary"
+                  env:
+                    DATABRICKS_HOST:          $(DATABRICKS_HOST_UAT)
+                    DATABRICKS_CLIENT_ID:     $(DATABRICKS_SP_CLIENT_ID_UAT)
+                    DATABRICKS_CLIENT_SECRET: $(DATABRICKS_SP_CLIENT_SECRET_UAT)
+
+                - task: CreateWorkItem@1
+                  condition: failed()
+                  inputs:
+                    workItemType: "Bug"
+                    title: "[AUTO] UAT Deploy Failed — Build $(Build.BuildNumber)"
+                    assignedTo: "$(Build.RequestedFor)"
+                    areaPath: "databricks-platform"
+                  displayName: "Create bug on failure"
