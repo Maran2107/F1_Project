@@ -8,8 +8,8 @@
 trigger:
   branches:
     include:
-      - Master          # CD: deploy to UAT on merge to main
-      - Dev        # CI only: validate bundle on develop changes
+      - main          # CD: deploy to UAT on merge to main
+      - develop       # CI only: validate bundle on develop changes
   paths:
     exclude:
       - README.md
@@ -19,8 +19,8 @@ trigger:
 pr:
   branches:
     include:
-      - Master          # PR: feature → develop, develop → main
-      - Dev
+      - main          # PR: feature → develop, develop → main
+      - develop
   paths:
     exclude:
       - README.md
@@ -272,6 +272,10 @@ stages:
           vmImage: ubuntu-latest
         dependsOn: PreDeployCheck
         environment: "Databricks-UAT"   # ← Approval gate is set HERE in Azure DevOps UI
+        # Grant pipeline access to System.AccessToken so the failure
+        # step can create a Bug work item via REST API (no marketplace task needed)
+        workspace:
+          clean: all
         strategy:
           runOnce:
             deploy:
@@ -333,11 +337,38 @@ stages:
                     DATABRICKS_CLIENT_ID:     $(DATABRICKS_SP_CLIENT_ID_UAT)
                     DATABRICKS_CLIENT_SECRET: $(DATABRICKS_SP_CLIENT_SECRET_UAT)
 
-                - task: CreateWorkItem@1
+                - script: |
+                    echo "▶ Creating Bug work item via Azure DevOps REST API..."
+
+                    TITLE="[AUTO] UAT Deploy Failed — Build $(Build.BuildNumber)"
+                    ORG_URL="$(System.TeamFoundationCollectionUri)"
+                    PROJECT="$(System.TeamProject)"
+                    API_URL="${ORG_URL}${PROJECT}/_apis/wit/workitems/\$Bug?api-version=7.1"
+
+                    PAYLOAD=$(cat <<EOF
+                    [
+                      { "op": "add", "path": "/fields/System.Title",       "value": "$TITLE" },
+                      { "op": "add", "path": "/fields/System.AssignedTo",  "value": "$(Build.RequestedFor)" },
+                      { "op": "add", "path": "/fields/System.Description", "value": "Pipeline: $(Build.DefinitionName)<br>Build: $(Build.BuildNumber)<br>Branch: $(Build.SourceBranchName)<br>Commit: $(Build.SourceVersion)<br>Triggered by: $(Build.RequestedFor)" },
+                      { "op": "add", "path": "/fields/Microsoft.VSTS.Common.Priority", "value": 1 }
+                    ]
+                    EOF
+                    )
+
+                    HTTP_STATUS=$(curl -s -o /tmp/wi_response.json -w "%{http_code}" \
+                      -X POST "$API_URL" \
+                      -H "Content-Type: application/json-patch+json" \
+                      -H "Authorization: Bearer $(System.AccessToken)" \
+                      -d "$PAYLOAD")
+
+                    if [ "$HTTP_STATUS" -eq 200 ] || [ "$HTTP_STATUS" -eq 201 ]; then
+                      WI_ID=$(cat /tmp/wi_response.json | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+                      echo "✅ Bug work item #$WI_ID created successfully"
+                    else
+                      echo "⚠️  Work item creation returned HTTP $HTTP_STATUS"
+                      cat /tmp/wi_response.json
+                    fi
                   condition: failed()
-                  inputs:
-                    workItemType: "Bug"
-                    title: "[AUTO] UAT Deploy Failed — Build $(Build.BuildNumber)"
-                    assignedTo: "$(Build.RequestedFor)"
-                    areaPath: "databricks-platform"
-                  displayName: "Create bug on failure"
+                  displayName: "Create bug work item on failure (REST API)"
+                  env:
+                    AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
